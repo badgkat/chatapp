@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.tmp
+*.gguf
+config.json
+*.webm
+*.wav
+kokoroenv/
+models/

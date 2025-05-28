@@ -1,25 +1,31 @@
-FROM python:3.13
+# Base image with Python 3.11
+FROM python:3.11-slim
 
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies (ffmpeg + build tools for Whisper, Llama)
+RUN apt-get update && \
+    apt-get install -y ffmpeg build-essential git curl && \
+    apt-get clean
+
+# Set working directory
 WORKDIR /app
+
+# Copy project files
 COPY . .
 
-RUN pip install -r requirements.txt
+# Install Python dependencies
+RUN python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip && \
+    /opt/venv/bin/pip install -r requirements.txt
 
-# -----------------------------------------------------------------
-# Copy certificates to make use of free open ai usage within the lab
-# REMOVE THIS WHEN DEPLOYING TO CODE ENGINE
+# Activate the venv for runtime
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy the self-signed root CA certificate into the container
-COPY certs/rootCA.crt /usr/local/share/ca-certificates/rootCA.crt
+# Expose Flask port
+EXPOSE 8000
 
-# Update the CA trust store to trust the self-signed certificate
-RUN chmod 644 /usr/local/share/ca-certificates/rootCA.crt && \
-  update-ca-certificates
-
-# Set the environment variable OPENAI_API_KEY to empty string
-ENV OPENAI_API_KEY=skills-network
-ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-# -----------------------------------------------------------------
-
-CMD ["python", "-u", "server.py"]
+# Entry point
+CMD ["python", "server.py"]
