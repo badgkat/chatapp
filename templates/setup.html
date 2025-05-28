@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Model Setup</title>
+  <link
+    rel="stylesheet"
+    href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+    integrity="sha384-JcKb8q3iqJ61gNV9KGb8thSsNjpSL0n8PARn9HuZOnIxN0hoP+VmmDGMN5t9UJ0Z"
+    crossorigin="anonymous"
+  />
+  <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+</head>
+<body class="container mt-5">
+    <h2>Select and Download a Model</h2>
+
+    <form id="model-form">
+        <label for="model">Choose a model:</label>
+        <select name="model" id="model" class="form-control mb-3" style="max-width: 400px;">
+            {% for label in model_options %}
+            <option value="{{ label }}">{{ label }}</option>
+            {% endfor %}
+        </select>
+        <input type="submit" value="Download and Set" class="btn btn-primary">
+    </form>
+
+    <div id="progress-container" class="mt-4" style="display: none;">
+        <label for="download-progress">Download Progress:</label>
+        <progress id="download-progress" value="0" max="100" style="width: 100%;"></progress>
+        <div id="progress-text" class="mt-2"></div>
+    </div>
+
+    <div class="mt-4">
+        <a href="/" id="back-link" style="display: none;">Back to Assistant</a>
+    </div>
+
+</body>
+<script src="../static/script.js"></script>
+</html>

@@ -1,65 +1,133 @@
 import base64
 import json
 from flask import Flask, render_template, request
-from worker import speech_to_text, text_to_speech, openai_process_message
 from flask_cors import CORS
 import os
+import requests
+from worker import (
+    speech_to_text,
+    text_to_speech,
+    process_message,
+    list_voices,
+    is_model_ready
+)
 
 app = Flask(__name__)
-cors = CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}})
+CONFIG_PATH = "config.json"
 
+MODEL_OPTIONS = {
+    "Gemma 3B Q4": "https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf"
+}
 
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def index():
-    return render_template('index.html')
+    model_ready = is_model_ready()
+    return render_template("index.html", model_ready=model_ready)
 
+@app.route("/setup", methods=["GET", "POST"])
+def setup_model():
+    os.makedirs("models", exist_ok=True)
 
-@app.route('/speech-to-text', methods=['POST'])
+    if request.method == "POST":
+        model_label = request.form["model"]
+        model_url = MODEL_OPTIONS[model_label]
+        local_path = os.path.join("models", os.path.basename(model_url))
+
+        try:
+            with requests.get(model_url, stream=True) as r:
+                r.raise_for_status()
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+
+            with open("config.json", "w") as f:
+                json.dump({"model_path": local_path}, f)
+
+            return f"Downloaded and configured: {model_label}"
+        except Exception as e:
+            return f"Download failed: {e}", 500
+    return render_template("setup.html", model_options=MODEL_OPTIONS.keys(), model_ready=is_model_ready())
+
+@app.route("/list-voices", methods=["GET"])
+def list_voices_route():
+    return app.response_class(
+        response=json.dumps({"voices": list_voices()}),
+        status=200,
+        mimetype="application/json"
+    )
+
+@app.route("/speech-to-text", methods=["POST"])
 def speech_to_text_route():
-    print("processing speech-to-text")
-    audio_binary = request.data # Get the user's speech from their request
-    text = speech_to_text(audio_binary) # Call speech_to_text function to transcribe the speech
-
-    # Return the response back to the user in JSON format
-    response = app.response_class(
+    print("Processing speech-to-text")
+    audio_binary = request.data
+    text = speech_to_text(audio_binary)
+    return app.response_class(
         response=json.dumps({'text': text}),
         status=200,
         mimetype='application/json'
     )
-    print(response)
-    print(response.data)
-    return response
 
-@app.route('/process-message', methods=['POST'])
+@app.route("/process-message", methods=["POST"])
 def process_message_route():
-    user_message = request.json['userMessage'] # Get user's message from their request
-    print('user_message', user_message)
+    data = request.json
+    user_message = data.get("userMessage", "")
+    voice = data.get("voice", "af_heart")
 
-    voice = request.json['voice'] # Get user's preferred voice from their request
-    print('voice', voice)
+    print("user_message:", user_message)
+    print("voice:", voice)
 
-    # Call openai_process_message function to process the user's message and get a response back
-    openai_response_text = openai_process_message(user_message)
+    response_text = process_message(user_message).strip()
+    response_text = os.linesep.join([s for s in response_text.splitlines() if s])
 
-    # Clean the response to remove any emptylines
-    openai_response_text = os.linesep.join([s for s in openai_response_text.splitlines() if s])
+    response_audio = text_to_speech(response_text, voice)
+    response_audio_base64 = base64.b64encode(response_audio).decode("utf-8")
 
-    # Call our text_to_speech function to convert OpenAI Api's reponse to speech
-    openai_response_speech = text_to_speech(openai_response_text, voice)
-
-    # convert openai_response_speech to base64 string so it can be sent back in the JSON response
-    openai_response_speech = base64.b64encode(openai_response_speech).decode('utf-8')
-
-    # Send a JSON response back to the user containing their message's response both in text and speech formats
-    response = app.response_class(
-        response=json.dumps({"openaiResponseText": openai_response_text, "openaiResponseSpeech": openai_response_speech}),
+    return app.response_class(
+        response=json.dumps({
+            "ResponseText": response_text,
+            "ResponseSpeech": response_audio_base64
+        }),
         status=200,
-        mimetype='application/json'
+        mimetype="application/json"
     )
 
-    print(response)
-    return response
+@app.route("/download-model", methods=["POST"])
+def download_model():
+    from flask import Response
 
+    data = request.json
+    model_label = data["model"]
+    model_url = MODEL_OPTIONS[model_label]
+    local_path = os.path.join("models", os.path.basename(model_url))
 
+    def generate():
+        try:
+            with requests.get(model_url, stream=True) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length", 0))
+                downloaded = 0
+
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            percent = int((downloaded / total) * 100)
+                            status = f"{percent}% downloaded..."
+                            yield json.dumps({"progress": percent, "status": status}) + "\n"
+
+            with open(CONFIG_PATH, "w") as f:
+                json.dump({"model_path": local_path}, f)
+
+            yield json.dumps({"progress": 100, "status": "Download complete."}) + "\n"
+
+        except Exception as e:
+            yield json.dumps({"progress": 0, "status": f"Download failed: {str(e)}"}) + "\n"
+
+    return Response(generate(), mimetype="text/plain")
+
+# This must come last
 if __name__ == "__main__":
     app.run(port=8000, host='0.0.0.0')

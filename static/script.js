@@ -30,9 +30,7 @@ const getSpeechToText = async (userRecording) => {
     method: "POST",
     body: userRecording.audioBlob,
   });
-  console.log(response);
   response = await response.json();
-  console.log(response);
   return response.text;
 };
 
@@ -43,44 +41,50 @@ const processUserMessage = async (userMessage) => {
     body: JSON.stringify({ userMessage: userMessage, voice: voiceOption }),
   });
   response = await response.json();
-  console.log(response);
   return response;
 };
 
 const cleanTextInput = (value) => {
   return value
-    .trim() // remove starting and ending spaces
-    .replace(/[\n\t]/g, "") // remove newlines and tabs
-    .replace(/<[^>]*>/g, "") // remove HTML tags
-    .replace(/[<>&;]/g, ""); // sanitize inputs
+    .trim()
+    .replace(/[\n\t]/g, "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/[<>&;]/g, "");
 };
 
 const recordAudio = () => {
-  return new Promise(async (resolve) => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mediaRecorder = new MediaRecorder(stream);
-    const audioChunks = [];
+  return new Promise(async (resolve, reject) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const audioChunks = [];
 
-    mediaRecorder.addEventListener("dataavailable", (event) => {
-      audioChunks.push(event.data);
-    });
-
-    const start = () => mediaRecorder.start();
-
-    const stop = () =>
-      new Promise((resolve) => {
-        mediaRecorder.addEventListener("stop", () => {
-          const audioBlob = new Blob(audioChunks, { type: "audio/mpeg" });
-          const audioUrl = URL.createObjectURL(audioBlob);
-          const audio = new Audio(audioUrl);
-          const play = () => audio.play();
-          resolve({ audioBlob, audioUrl, play });
-        });
-
-        mediaRecorder.stop();
+      mediaRecorder.addEventListener("dataavailable", (event) => {
+        if (event.data.size > 0) {
+          audioChunks.push(event.data);
+        }
       });
 
-    resolve({ start, stop });
+      const start = () => mediaRecorder.start();
+
+      const stop = () =>
+        new Promise((resolveStop) => {
+          mediaRecorder.addEventListener("stop", () => {
+            const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+            const audioUrl = URL.createObjectURL(audioBlob);
+            const audio = new Audio(audioUrl);
+            const play = () => audio.play();
+            resolveStop({ audioBlob, audioUrl, play });
+          });
+          mediaRecorder.stop();
+        });
+
+      resolve({ start, stop });
+    } catch (err) {
+      console.error("Microphone access denied or unavailable:", err);
+      alert("Microphone access is required to record audio.");
+      reject(err);
+    }
   });
 };
 
@@ -102,7 +106,7 @@ const playResponseAudio = (function () {
   const df = document.createDocumentFragment();
   return function Sound(src) {
     const snd = new Audio(src);
-    df.appendChild(snd); // keep in fragment until finished playing
+    df.appendChild(snd);
     snd.addEventListener("ended", function () {
       df.removeChild(snd);
     });
@@ -116,16 +120,13 @@ const getRandomID = () => {
 };
 
 const scrollToBottom = () => {
-  // Scroll the chat window to the bottom
   $("#chat-window").animate({
     scrollTop: $("#chat-window")[0].scrollHeight,
   });
 };
-const populateUserMessage = (userMessage, userRecording) => {
-  // Clear the input field
-  $("#message-input").val("");
 
-  // Append the user's message to the message list
+const populateUserMessage = (userMessage, userRecording) => {
+  $("#message-input").val("");
 
   if (userRecording) {
     const userRepeatButtonID = getRandomID();
@@ -157,35 +158,48 @@ const populateBotResponse = async (userMessage) => {
   const repeatButtonID = getRandomID();
   botRepeatButtonIDToIndexMap[repeatButtonID] = responses.length - 1;
   hideBotLoadingAnimation();
-  // Append the random message to the message list
   $("#message-list").append(
     `<div class='message-line'><div class='message-box${
       !lightMode ? " dark" : ""
-    }'>${
-      response.openaiResponseText
-    }</div><button id='${repeatButtonID}' class='btn volume repeat-button' onclick='playResponseAudio("data:audio/wav;base64," + responses[botRepeatButtonIDToIndexMap[this.id]].openaiResponseSpeech);console.log(this.id)'><i class='fa fa-volume-up'></i></button></div>`
+    }'>${response.ResponseText}</div>
+    <button id='${repeatButtonID}' class='btn volume repeat-button' onclick='playResponseAudio("data:audio/wav;base64," + responses[botRepeatButtonIDToIndexMap[this.id]].ResponseSpeech);'><i class='fa fa-volume-up'></i></button></div>`
   );
 
-  playResponseAudio("data:audio/wav;base64," + response.openaiResponseSpeech);
-
+  playResponseAudio("data:audio/wav;base64," + response.ResponseSpeech);
   scrollToBottom();
 };
 
+// === MAIN UI INIT ===
 $(document).ready(function () {
-  // Listen for the "Enter" key being pressed in the input field
+  // Load voice options dynamically
+  fetch(baseUrl + "/list-voices")
+    .then((res) => res.json())
+    .then((data) => {
+      const select = $("#voice-options");
+      select.empty();
+      select.append(`<option value="">default</option>`);
+      data.voices.forEach((voice) => {
+        const label = voice.replace("af_", "").toUpperCase();
+        select.append(`<option value="${voice}">${label}</option>`);
+      });
+    })
+    .catch((err) => {
+      console.error("Failed to load voices:", err);
+    });
+
+  // Message input key handler
   $("#message-input").keyup(function (event) {
     let inputVal = cleanTextInput($("#message-input").val());
 
     if (event.keyCode === 13 && inputVal != "") {
       const message = inputVal;
-
       populateUserMessage(message, null);
       populateBotResponse(message);
     }
 
     inputVal = $("#message-input").val();
 
-    if (inputVal == "" || inputVal == null) {
+    if (!inputVal) {
       $("#send-button")
         .removeClass("send")
         .addClass("microphone")
@@ -198,38 +212,45 @@ $(document).ready(function () {
     }
   });
 
-  // When the user clicks the "Send" button
+  // Send button click handler
   $("#send-button").click(async function () {
-    if ($("#send-button").hasClass("microphone") && !recording) {
-      toggleRecording();
-      $(".fa-microphone").css("color", "#f44336");
-      console.log("start recording");
-      recording = true;
+    const $icon = $(".fa-microphone");
+
+    if ($(this).hasClass("microphone") && !recording) {
+      try {
+        recorder = await recordAudio();
+        recorder.start();
+        recording = true;
+        $icon.css("color", "#f44336");
+      } catch {
+        recording = false;
+        $icon.css("color", "#125ee5");
+      }
     } else if (recording) {
-      toggleRecording().then(async (userRecording) => {
-        console.log("stop recording");
+      try {
+        const userRecording = await recorder.stop();
+        recording = false;
+        $icon.css("color", "#125ee5");
+
         await showUserLoadingAnimation();
         const userMessage = await getSpeechToText(userRecording);
         populateUserMessage(userMessage, userRecording);
         populateBotResponse(userMessage);
-      });
-      $(".fa-microphone").css("color", "#125ee5");
-      recording = false;
+      } catch (err) {
+        console.error("Failed to stop recording or process audio:", err);
+      }
     } else {
-      // Get the message the user typed in
       const message = cleanTextInput($("#message-input").val());
-
       populateUserMessage(message, null);
       populateBotResponse(message);
-
-      $("#send-button")
+      $(this)
         .removeClass("send")
         .addClass("microphone")
         .html("<i class='fa fa-microphone'></i>");
     }
   });
 
-  // handle the event of switching light-dark mode
+  // Toggle dark/light mode
   $("#light-dark-mode-switch").change(function () {
     $("body").toggleClass("dark-mode");
     $(".message-box").toggleClass("dark");
@@ -238,8 +259,73 @@ $(document).ready(function () {
     lightMode = !lightMode;
   });
 
+  // Update selected voice
   $("#voice-options").change(function () {
     voiceOption = $(this).val();
-    console.log(voiceOption);
+    console.log("Selected voice:", voiceOption);
+  });
+});
+
+document.addEventListener("DOMContentLoaded", function () {
+  const form = document.getElementById("model-form");
+  if (!form) return; // Only run on setup.html
+
+  const progressBar = document.getElementById("download-progress");
+  const progressContainer = document.getElementById("progress-container");
+  const progressText = document.getElementById("progress-text");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const model = document.getElementById("model").value;
+    progressBar.value = 0;
+    progressText.textContent = "Starting download...";
+    progressContainer.style.display = "block";
+
+    try {
+      const response = await fetch("/download-model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+
+      if (!response.ok || !response.body) {
+        progressText.textContent = "Download failed.";
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let received = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += decoder.decode(value, { stream: true });
+
+        const lines = received.trim().split("\n");
+        const lastLine = lines[lines.length - 1];
+
+        try {
+          const { progress, status } = JSON.parse(lastLine);
+          progressBar.value = progress;
+          progressText.textContent = status;
+        } catch {
+          // ignore malformed JSON (e.g., incomplete chunk)
+        }
+      }
+
+      progressText.textContent = "Download complete.";
+      form.querySelector("input[type='submit']").value = "Downloaded";
+      form.querySelector("input[type='submit']").disabled = true;
+
+      const backLink = document.getElementById("back-link");
+      if (backLink) {
+        backLink.style.display = "block";
+      }
+
+    } catch (err) {
+      progressText.textContent = "Error: " + err.message;
+    }
   });
 });
