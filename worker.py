@@ -8,14 +8,21 @@ import re
 import subprocess
 import tempfile
 import json
+from context_state import ChatState
 
+CHAT_STATES: dict[str, ChatState] = {}     # keyed by session ID
+
+# Default System Prompt
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 # Load Whisper and Kokoro models once
 whisper_model = whisper.load_model("tiny.en")
 tts_pipeline = KPipeline(lang_code='a')
 
-CONFIG_PATH = "config.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
 DEFAULT_MODEL_PATH = "./models/gemma-3-4b-it-Q4_K_M.gguf"
 llm = None
 
@@ -24,12 +31,15 @@ def load_model():
     if llm is not None:
         return llm
 
+    # read config
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
-            config = json.load(f)
-            model_path = config.get("model_path", DEFAULT_MODEL_PATH)
+            cfg = json.load(f)
+            model_path = cfg.get("model_path", DEFAULT_MODEL_PATH)
+            p = cfg.get("params", {})
     else:
         model_path = DEFAULT_MODEL_PATH
+        p = {}
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(
@@ -39,12 +49,17 @@ def load_model():
 
     llm = Llama(
         model_path=model_path,
-        n_ctx=2048,
-        n_threads=12,
-        n_batch=64,
-        n_gpu_layers=0
+        n_ctx=p.get("n_ctx", 2048),
+        n_threads=p.get("n_threads", 12),
+        n_batch=p.get("n_batch", 64),
+        n_gpu_layers=p.get("n_gpu_layers", 0),
     )
     return llm
+
+def count_tokens(txt: str) -> int:
+    llm = load_model()                     # cached
+    # llama_cpp expects bytes and returns a list[int]
+    return len(llm.tokenize(txt.encode()))
 
 def is_model_ready():
     if os.path.exists(CONFIG_PATH):
@@ -68,21 +83,72 @@ def clean_tts_text(text: str) -> str:
     # Remove markdown-style emphasis (*text* or _text_)
     return re.sub(r"[*_](.*?)[*_]", r"\1", text)
 
-def process_message(user_input: str) -> str:
-    """Generate a response using the local LLM."""
-    prompt = f"""<start_of_turn>user
-    {user_input}<end_of_turn>
-    <start_of_turn>model
+def build_prompt(state: ChatState,
+                 user_in: str,
+                 sys_prompt: str,
+                 budget: int) -> str:
+    state.window.append(("user", user_in))
+
+    parts = [f"<sys>{sys_prompt}</sys>"]
+    if state.summary:
+        parts.append(f"<summary>{state.summary}</summary>")
+    parts += [f"<{r}>{t}</{r}>" for r, t in state.window]
+    prompt = "".join(parts)
+
+    if count_tokens(prompt) > budget:
+        half = len(state.window) // 2
+        to_sum = "".join(f"<{r}>{t}</{r}>" for r, t in list(state.window)[:half])
+
+        # quick summary call
+        summary_text = load_model()(
+            f"{sys_prompt}\nSummarise:\n{to_sum}\nEnd with <END>",
+            max_tokens=120,
+            stop=["<END>"]
+        )["choices"][0]["text"].strip()
+        state.summary = summary_text
+        for _ in range(half):
+            state.window.popleft()
+
+        parts = [f"<sys>{sys_prompt}</sys>",
+                 f"<summary>{state.summary}</summary>",
+                 *[f"<{r}>{t}</{r}>" for r, t in state.window]]
+        prompt = "".join(parts)
+
+    return prompt
+
+def process_message(user_text: str, session_id: str = "default") -> str:
     """
-    llm_instance = load_model()
-    output = llm_instance(
-        prompt,
-        max_tokens=200,
-        stop=["<end_of_turn>"],
-        temperature=0.7,
-        top_p=0.95,
-    )
-    return output["choices"][0]["text"].strip()
+    Run one turn of inference.
+    The system prompt, generation params, and model path live in config.json.
+    A constraint note tells the model its token budget and asks it to finish with <END>.
+    """
+
+    cfg = json.load(open(CONFIG_PATH))
+    gen  = cfg.get("params", {})
+    sysp = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+    limit = int(gen.get("max_tokens", 200))
+    n_ctx = int(gen.get("n_ctx", 2048))
+    budget = n_ctx - limit - 32           # small safety margin
+
+    state = CHAT_STATES.setdefault(session_id, ChatState())
+    prompt = build_prompt(state, user_text, sysp, budget)
+
+    reply = load_model()(
+        prompt +
+        "\n### Constraint\n" +
+        f"Reply ≤{limit} tokens and finish with <END>",
+        max_tokens=limit,
+        temperature=gen.get("temperature", 0.7),
+        top_p=gen.get("top_p", 0.95),
+        stop=["<END>"]
+    )["choices"][0]["text"].strip()
+
+    if reply.endswith("<END>"):
+        reply = reply[:-5].rstrip()
+
+    state.window.append(("assistant", reply))
+    return reply
+
 
 
 def speech_to_text(audio_data: bytes) -> str:

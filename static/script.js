@@ -1,4 +1,7 @@
-let lightMode = true;
+(() => {   
+const saved = localStorage.getItem("uiMode");           // "light" | "dark" | null
+const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+let lightMode = saved ? saved === "light" : !prefersDark;
 let recorder = null;
 let recording = false;
 let voiceOption = "default";
@@ -171,6 +174,14 @@ const populateBotResponse = async (userMessage) => {
 
 // === MAIN UI INIT ===
 $(document).ready(function () {
+  // apply stored/default theme before any UI work
+  if (!lightMode) {
+    $("body").addClass("dark-mode");
+    $(".message-box").addClass("dark");
+    $(".loading-dots").addClass("dark");
+    $(".dot").addClass("dark-dot");
+    $("#light-dark-mode-switch").prop("checked", true); // show dark as active
+  }
   // Load voice options dynamically
   fetch(baseUrl + "/list-voices")
     .then((res) => res.json())
@@ -257,6 +268,8 @@ $(document).ready(function () {
     $(".loading-dots").toggleClass("dark");
     $(".dot").toggleClass("dark-dot");
     lightMode = !lightMode;
+    localStorage.setItem("uiMode", lightMode ? "light" : "dark");
+
   });
 
   // Update selected voice
@@ -269,6 +282,116 @@ $(document).ready(function () {
 document.addEventListener("DOMContentLoaded", function () {
   const form = document.getElementById("model-form");
   if (!form) return; // Only run on setup.html
+  /* === parameter UI bootstrap === */
+  const paramKeys = [
+    "n_ctx","max_tokens","temperature",
+    "top_p","n_threads","n_batch","n_gpu_layers"
+  ];
+
+  function populateParams(p) {
+    paramKeys.forEach(k => {
+      const $input = $(`div[data-pkey='${k}'] input`);
+      if ($input.length) $input.val(p[k]);
+    });
+  }
+
+  /* === load model limits to set max attrs & hint text === */
+  fetch("/model-info")
+    .then(r => r.ok ? r.json() : {})
+    .then(info => {
+      const maxCtx = info.max_context || 4096;
+      // Context tokens
+      const ctxInput = $("div[data-pkey='n_ctx'] input")[0];
+      ctxInput.max = maxCtx;
+      $("[data-for='n_ctx']").text(`256 – ${maxCtx}`);
+      // Max response tokens: hard-cap at same value
+      const respInput = $("div[data-pkey='max_tokens'] input")[0];
+      respInput.max = maxCtx;
+      $("[data-for='max_tokens']").text(`10 – ${maxCtx}`);
+    })
+    .catch(err => console.error("Model-info fetch failed:", err));
+
+  /* ----------------  static ranges  ---------------- */
+  const staticRanges = {
+    temperature : { min: 0  , max: 2   , text: "0 – 2"        },
+    top_p       : { min: 0  , max: 1   , text: "0 – 1"        },
+    n_threads   : { min: 1  , max: (navigator.hardwareConcurrency || 16),
+                    text: `1 – ${(navigator.hardwareConcurrency || 16)}` },
+    n_batch     : { min: 1  , max: 256 , text: "1 – 256"      },
+    n_gpu_layers: { min: 0  , max: 40  , text: "0 – 40"       }
+  };
+
+  /* helper – attach span if not present, then set text */
+  function setHint(key, hintText) {
+    const $grp = $(`div[data-pkey='${key}']`);
+    if (!$grp.find(".range-hint").length) {
+      $grp.append(
+        `<div class="input-group-append">
+          <span class="input-group-text range-hint" data-for="${key}"></span>
+        </div>`
+      );
+    }
+    $grp.find(".range-hint").text(hintText);
+  }
+
+  /* static hints */
+  Object.entries(staticRanges).forEach(([k, v]) => setHint(k, v.text));
+
+  /* dynamic hints already set for n_ctx and max_tokens earlier */
+
+
+  fetch("/get-params")
+    .then(r => r.ok ? r.json() : {})
+    .then(populateParams)
+    .catch(err => console.error("Param fetch failed:", err));
+
+  document.getElementById("params-form").addEventListener("submit", async e => {
+    e.preventDefault();
+    const body = {};
+    paramKeys.forEach(k => {
+      body[k] = parseFloat($(`div[data-pkey='${k}'] input`).val());
+    });
+    const res = await fetch("/update-params", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify(body)
+    });
+    $("#params-status").text(res.ok ? "Saved." : "Error");
+  });
+
+  /* enable Bootstrap tooltips once */
+  if ($.fn.tooltip) {                 // run only if Bootstrap JS is present
+    $('[data-toggle="tooltip"]').tooltip();
+  }
+
+  /* === system prompt bootstrap === */
+  const $promptBox = $("#system-prompt");
+
+  fetch("/get-system-prompt")
+    .then(r => r.ok ? r.json() : {})
+    .then(d => {
+        const txt = d.prompt ?? "";
+        if (txt) {
+            $promptBox.val(txt).removeAttr("placeholder");
+        } else {
+            $promptBox
+                .val("")                      // ensure empty
+                .attr("placeholder", "You are a helpful assistant.");
+        }
+    })
+    .catch(err => console.error("Prompt load failed:", err));
+
+  $("#prompt-form").submit(async e => {
+    e.preventDefault();
+    const prompt = $("#system-prompt").val();
+    const res = await fetch("/update-system-prompt", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({prompt})
+    });
+    $("#prompt-status").text(res.ok ? "Saved." : "Error");
+  });
+
 
   const progressBar = document.getElementById("download-progress");
   const progressContainer = document.getElementById("progress-container");
@@ -313,6 +436,23 @@ document.addEventListener("DOMContentLoaded", function () {
         } catch {
           // ignore malformed JSON (e.g., incomplete chunk)
         }
+          /* save values */
+          document.getElementById("params-form").addEventListener("submit", async e => {
+            e.preventDefault();
+            const body = {};
+            paramKeys.forEach(k =>
+                  body[k] = parseFloat($(`div[data-pkey='${k}'] input`).val())
+            );
+            const res = await fetch("/update-params", {
+              method:"POST",
+              headers:{ "Content-Type":"application/json" },
+              body:JSON.stringify(body)
+            });
+            $("#params-status").text(res.ok ? "Saved." : "Error");
+          });
+        if ($.fn.tooltip) {                 // run only if Bootstrap JS is present
+          $('[data-toggle="tooltip"]').tooltip();
+        }
       }
 
       progressText.textContent = "Download complete.";
@@ -329,3 +469,4 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 });
+})(); 

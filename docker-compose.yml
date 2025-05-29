@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  chatapp:
+    build: .
+    container_name: chatapp
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./voices:/app/voices
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
