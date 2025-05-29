@@ -4,11 +4,13 @@ const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
 let lightMode = saved ? saved === "light" : !prefersDark;
 let recorder = null;
 let recording = false;
+let talkingMode = true;
 let voiceOption = "default";
 const responses = [];
 const botRepeatButtonIDToIndexMap = {};
 const userRepeatButtonIDToRecordingMap = {};
 const baseUrl = window.location.origin;
+
 
 async function showBotLoadingAnimation() {
   await sleep(500);
@@ -41,7 +43,11 @@ const processUserMessage = async (userMessage) => {
   let response = await fetch(baseUrl + "/process-message", {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ userMessage: userMessage, voice: voiceOption }),
+    body: JSON.stringify({ 
+      userMessage: userMessage, 
+      voice: voiceOption,
+      textOnly: !talkingMode
+   }),
   });
   response = await response.json();
   return response;
@@ -167,9 +173,10 @@ const populateBotResponse = async (userMessage) => {
     }'>${response.ResponseText}</div>
     <button id='${repeatButtonID}' class='btn volume repeat-button' onclick='playResponseAudio("data:audio/wav;base64," + responses[botRepeatButtonIDToIndexMap[this.id]].ResponseSpeech);'><i class='fa fa-volume-up'></i></button></div>`
   );
-
-  playResponseAudio("data:audio/wav;base64," + response.ResponseSpeech);
-  scrollToBottom();
+  if (talkingMode) {
+    playResponseAudio("data:audio/wav;base64," + response.ResponseSpeech);
+    scrollToBottom();
+  }
 };
 
 // === MAIN UI INIT ===
@@ -270,6 +277,11 @@ $(document).ready(function () {
     lightMode = !lightMode;
     localStorage.setItem("uiMode", lightMode ? "light" : "dark");
 
+  });
+
+  // Toggle talking mode
+  $("#audio-toggle").change(function () {
+    talkingMode = $(this).is(":checked");
   });
 
   // Update selected voice

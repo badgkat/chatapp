@@ -245,25 +245,24 @@ def tts():
 
 
 @app.route("/process-message", methods=["POST"])
-def process_route():                        # server.py
-    data = request.get_json(force=True) or {}
-    user_msg = data.get("userMessage", "")
-    voice    = data.get("voice") or "af_heart"
+def process_route():
+    data       = request.get_json(force=True) or {}
+    user_msg   = data.get("userMessage", "")
+    voice      = data.get("voice", "af_heart")
+    text_only  = bool(data.get("textOnly"))
 
-    # session id
     sid = session.get("sid") or secrets.token_hex(8)
     session["sid"] = sid
 
-    # LLM reply
     response_txt = process_message(user_msg, session_id=sid).strip()
 
-    # TTS
-    wav        = text_to_speech(response_txt, voice)
-    audio_b64  = base64.b64encode(wav).decode()
+    if text_only:
+        return jsonify({"ResponseText": response_txt, "ResponseSpeech": ""})
 
+    wav = text_to_speech(response_txt, voice)
     return jsonify({
         "ResponseText":  response_txt,
-        "ResponseSpeech": audio_b64
+        "ResponseSpeech": base64.b64encode(wav).decode()
     })
 
 # ---------------------------------------------------------------------------
