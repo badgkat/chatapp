@@ -1,72 +1,52 @@
-import whisper
-from kokoro import KPipeline
-import soundfile as sf
+"""
+worker.py ― core back-end logic
+• Loads a local GGUF model with llama-cpp-python
+• Handles STT (Whisper) and TTS (Kokoro)
+• Maintains lightweight chat state per session
+• Guarantees plain-text answers without role labels
+"""
+from __future__ import annotations
+
+import base64
 import io
-from llama_cpp import Llama
+import json
 import os
 import re
 import subprocess
 import tempfile
-import json
-from context_state import ChatState
+import numpy as np
+from pathlib import Path
+from typing import List, Tuple
 
-CHAT_STATES: dict[str, ChatState] = {}     # keyed by session ID
+import soundfile as sf
+import whisper
+from kokoro import KPipeline
+from llama_cpp import Llama
 
-# Default System Prompt
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+from context_state import ChatState   # small @dataclass storing a .window list
 
-
-# Load Whisper and Kokoro models once
-whisper_model = whisper.load_model("tiny.en")
-tts_pipeline = KPipeline(lang_code='a')
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-
-DEFAULT_MODEL_PATH = "./models/gemma-3-4b-it-Q4_K_M.gguf"
-llm = None
-
-def load_model():
-    global llm
-    if llm is not None:
-        return llm
-
-    # read config
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
-            model_path = cfg.get("model_path", DEFAULT_MODEL_PATH)
-            p = cfg.get("params", {})
-    else:
-        model_path = DEFAULT_MODEL_PATH
-        p = {}
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model file not found at {model_path}. "
-            "Visit http://localhost:8000/setup to download one."
-        )
-
-    llm = Llama(
-        model_path=model_path,
-        n_ctx=p.get("n_ctx", 2048),
-        n_threads=p.get("n_threads", 12),
-        n_batch=p.get("n_batch", 64),
-        n_gpu_layers=p.get("n_gpu_layers", 0),
+# --------------------------------------------------------------------------- #
+# Config & globals
+# --------------------------------------------------------------------------- #
+CHAT_STATES: dict[str, ChatState] = {}          # keyed by session ID
+ROOT              = Path(__file__).parent
+CONFIG_PATH       = ROOT / "config.json"
+DEFAULT_MODEL     = ROOT / "models" / "gemma-3-4b-it-Q4_K_M.gguf"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful, harmless, and honest AI assistant. "
     )
-    return llm
 
-def count_tokens(txt: str) -> int:
-    llm = load_model()                     # cached
-    # llama_cpp expects bytes and returns a list[int]
-    return len(llm.tokenize(txt.encode()))
+# Regex to strip role labels that sometimes bleed from fine-tuned models
+ROLE_RE = re.compile(r'^\s*(?:###\s*)?(?:Response|Assistant)\s*:?\s*', re.I)
 
-def is_model_ready():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
-            model_path = json.load(f).get("model_path")
-            return model_path and os.path.exists(model_path)
-    return False
+llm: Llama | None = None               # lazily loaded singleton
+whisper_model = whisper.load_model("tiny.en")
+tts_pipeline  = KPipeline(lang_code="a")
+
+
+# --------------------------------------------------------------------------- #
+# Utility helpers
+# --------------------------------------------------------------------------- #
 
 def load_voice(voice_name):
     local_path = f"./voices/{voice_name}.pt"
@@ -78,103 +58,129 @@ def load_voice(voice_name):
             return tts_pipeline(text, voice=voice_name)
     return tts_func
 
-    
+def strip_role(text: str) -> str:
+    """Remove 'Assistant:' or '### Response' etc. from start of string."""
+    return ROLE_RE.sub("", text).lstrip()
+
+
 def clean_tts_text(text: str) -> str:
-    # Remove markdown-style emphasis (*text* or _text_)
-    return re.sub(r"[*_](.*?)[*_]", r"\1", text)
+    """Sanitize for speech: strip role tags, markdown, and special chars."""
+    text = strip_role(text)
+    text = re.sub(r"[*_~`>#-]", "", text)          # remove markdown symbols
+    text = re.sub(r"\s{2,}", " ", text)            # compress extra spaces
+    return text.strip()
+
+
+def estimate_tokens(text: str) -> int:
+    """Crude token estimator (≈ 4 chars/token)."""
+    return max(1, len(text) // 4)
+
+
+def load_model() -> Llama:
+    """Lazy-load and cache llama-cpp model based on config.json."""
+    global llm
+    if llm is not None:
+        return llm
+
+    # read optional config
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open() as f:
+            cfg = json.load(f)
+        model_path = Path(cfg.get("model_path", DEFAULT_MODEL))
+        params     = cfg.get("params", {})
+    else:
+        model_path = DEFAULT_MODEL
+        params     = {}
+
+    llm = Llama(
+        model_path=str(model_path),
+        n_ctx=params.get("n_ctx", 2048),
+        n_threads=params.get("n_threads", os.cpu_count() or 8),
+        n_batch=params.get("n_batch", 64),
+        n_gpu_layers=params.get("n_gpu_layers", 0),   # CPU by default
+    )
+    return llm
+
 
 def build_prompt(state: ChatState,
-                 user_in: str,
-                 sys_prompt: str,
-                 budget: int) -> str:
-    state.window.append(("user", user_in))
+                 user_msg: str,
+                 system_prompt: str,
+                 budget_tokens: int) -> str:
+    """
+    Assemble system + recent chat history + new user message
+    ensuring token count < budget_tokens.
+    """
+    hist: List[Tuple[str, str]] = state.window.copy()
+    hist.append(("user", user_msg))
 
-    parts = [f"<sys>{sys_prompt}</sys>"]
-    if state.summary:
-        parts.append(f"<summary>{state.summary}</summary>")
-    parts += [f"<{r}>{t}</{r}>" for r, t in state.window]
-    prompt = "".join(parts)
+    # walk history backwards until under budget
+    parts: List[str] = [f"### System\n{system_prompt}"]
+    running_tokens = estimate_tokens(parts[0])
 
-    if count_tokens(prompt) > budget:
-        half = len(state.window) // 2
-        to_sum = "".join(f"<{r}>{t}</{r}>" for r, t in list(state.window)[:half])
+    for role, content in reversed(hist):
+        segment = f"\n### {role.capitalize()}\n{content}"
+        seg_tokens = estimate_tokens(segment)
+        if running_tokens + seg_tokens > budget_tokens:
+            break
+        parts.insert(1, segment)          # keep chronological order
+        running_tokens += seg_tokens
 
-        # quick summary call
-        summary_text = load_model()(
-            f"{sys_prompt}\nSummarise:\n{to_sum}\nEnd with <END>",
-            max_tokens=120,
-            stop=["<END>"]
-        )["choices"][0]["text"].strip()
-        state.summary = summary_text
-        for _ in range(half):
-            state.window.popleft()
+    return "".join(parts).rstrip()
 
-        parts = [f"<sys>{sys_prompt}</sys>",
-                 f"<summary>{state.summary}</summary>",
-                 *[f"<{r}>{t}</{r}>" for r, t in state.window]]
-        prompt = "".join(parts)
 
-    return prompt
-
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
 def process_message(user_text: str, session_id: str = "default") -> str:
     """
-    Run one turn of inference.
-    The system prompt, generation params, and model path live in config.json.
-    A constraint note tells the model its token budget and asks it to finish with <END>.
+    Run one inference turn and update chat history.
+    Returns assistant reply (plain text, no role tags, no <END>).
     """
 
-    cfg = json.load(open(CONFIG_PATH))
-    gen  = cfg.get("params", {})
-    sysp = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-    limit = int(gen.get("max_tokens", 200))
-    n_ctx = int(gen.get("n_ctx", 2048))
-    budget = n_ctx - limit - 32           # small safety margin
+    cfg         = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
+    gen_params  = cfg.get("params", {})
+    system_p    = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
 
-    state = CHAT_STATES.setdefault(session_id, ChatState())
-    prompt = build_prompt(state, user_text, sysp, budget)
+    max_tokens = int(gen_params.get("max_tokens", 200))
+    n_ctx      = int(gen_params.get("n_ctx", 2048))
+    budget     = n_ctx - max_tokens - 32            # margin
 
-    reply = load_model()(
-        prompt +
-        "\n### Constraint\n" +
-        f"Reply ≤{limit} tokens and finish with <END>",
-        max_tokens=limit,
-        temperature=gen.get("temperature", 0.7),
-        top_p=gen.get("top_p", 0.95),
+    state  = CHAT_STATES.setdefault(session_id, ChatState())
+    prompt = build_prompt(state, user_text, system_p, budget)
+
+    constraint = (
+        "Reply with plain text only. No role labels or markdown headings.\n"
+        f"Reply ≤{max_tokens} tokens and finish with <END>"
+    )
+
+    raw = load_model()(
+        prompt + "\n### Constraint\n" + constraint,
+        max_tokens=max_tokens,
+        temperature=gen_params.get("temperature", 0.7),
+        top_p=gen_params.get("top_p", 0.95),
         stop=["<END>"]
-    )["choices"][0]["text"].strip()
+    )["choices"][0]["text"]
 
-    if reply.endswith("<END>"):
-        reply = reply[:-5].rstrip()
+    # Extract only the portion intended as the assistant's message
+    # Remove <END> and any trailing junk
+    text = raw.strip()
+    text = text.split("<END>")[0].strip()
+
+    # Optionally strip any leading label
+    reply = strip_role(text)
 
     state.window.append(("assistant", reply))
     return reply
 
 
+def speech_to_text(audio_bytes: bytes) -> str:
+    """Whisper STT from raw audio bytes (webm, wav, etc.)."""
+    with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        result = whisper_model.transcribe(tmp.name, language="en")
+    return result["text"].strip()
 
-def speech_to_text(audio_data: bytes) -> str:
-    """Transcribe WebM audio using Whisper after conversion to WAV."""
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_in:
-        temp_in.write(audio_data)
-        temp_in.flush()
-
-    temp_out_path = temp_in.name.replace(".webm", ".wav")
-
-    # Convert to WAV using ffmpeg
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", temp_in.name,
-        "-ar", "16000",  # downsample to 16kHz if needed
-        "-ac", "1",      # mono channel
-        temp_out_path
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # Transcribe
-    result = whisper_model.transcribe(temp_out_path)
-
-    os.remove(temp_in.name)
-    os.remove(temp_out_path)
-
-    return result["text"]
 
 def text_to_speech(text: str, voice: str = "af_heart") -> bytes:
     if voice not in list_voices():
@@ -193,13 +199,8 @@ def text_to_speech(text: str, voice: str = "af_heart") -> bytes:
     return buf.getvalue()
 
 
-def list_voices() -> list:
-    """Scan the voices/ directory and return available voice IDs."""
-    voices = []
-    voice_dir = "./voices"
-    if os.path.isdir(voice_dir):
-        for f in os.listdir(voice_dir):
-            if f.endswith(".pt"):
-                voice_id = os.path.splitext(f)[0]
-                voices.append(voice_id)
-    return sorted(voices)
+
+def list_voices() -> List[str]:
+    """Return available voice IDs by scanning ./voices/*.pt"""
+    voice_dir = ROOT / "voices"
+    return sorted(p.stem for p in voice_dir.glob("*.pt")) if voice_dir.is_dir() else []
