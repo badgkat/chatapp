@@ -50,23 +50,6 @@ python server.py
 
 5. Open http://localhost:8000 in your browser.
 
----
-
-## Setup (Docker)
-
-1. Build the image:
-
-```
-docker build -t chatapp .
-```
-
-2. Run the container:
-
-```
-docker run -p 8000:8000 chatapp
-```
-
----
 
 ## Model Setup
 
