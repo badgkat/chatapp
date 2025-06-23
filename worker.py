@@ -7,16 +7,16 @@ worker.py ― core back-end logic
 """
 from __future__ import annotations
 
-import base64
 import io
 import json
 import os
 import re
-import subprocess
 import tempfile
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, cast
+import torch
+
 
 import soundfile as sf
 import whisper
@@ -24,6 +24,7 @@ from kokoro import KPipeline
 from llama_cpp import Llama
 
 from context_state import ChatState   # small @dataclass storing a .window list
+from collections.abc import Sequence
 
 # --------------------------------------------------------------------------- #
 # Config & globals
@@ -62,10 +63,20 @@ def strip_role(text: str) -> str:
     """Remove 'Assistant:' or '### Response' etc. from start of string."""
     return ROLE_RE.sub("", text).lstrip()
 
+def extract_assistant_section(text: str) -> str:
+    """Extract content from '### Assistant' to either next heading or <END>."""
+    # Normalize and isolate
+    text = text.strip().split("<END>")[0]
+
+    # Match the Assistant section
+    match = re.search(r'###\s*Assistant\s*\n+(.*?)(\n###|\Z)', text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
 
 def clean_tts_text(text: str) -> str:
     """Sanitize for speech: strip role tags, markdown, and special chars."""
-    text = strip_role(text)
+    reply = extract_assistant_section(text)
     text = re.sub(r"[*_~`>#-]", "", text)          # remove markdown symbols
     text = re.sub(r"\s{2,}", " ", text)            # compress extra spaces
     return text.strip()
@@ -110,7 +121,7 @@ def build_prompt(state: ChatState,
     Assemble system + recent chat history + new user message
     ensuring token count < budget_tokens.
     """
-    hist: List[Tuple[str, str]] = state.window.copy()
+    hist: Sequence[Tuple[str, str]] = list(state.window)
     hist.append(("user", user_msg))
 
     # walk history backwards until under budget
@@ -147,31 +158,32 @@ def process_message(user_text: str, session_id: str = "default") -> str:
 
     state  = CHAT_STATES.setdefault(session_id, ChatState())
     prompt = build_prompt(state, user_text, system_p, budget)
-
     constraint = (
-        "Reply with plain text only. No role labels or markdown headings.\n"
-        f"Reply ≤{max_tokens} tokens and finish with <END>"
+        "Respond using markdown sections. Begin your response with:\n\n"
+        "### Assistant\nYour answer here.\n\n"
+        "End with <END>. Don't include anything after <END>."
     )
 
-    raw = load_model()(
+    response = load_model()(
         prompt + "\n### Constraint\n" + constraint,
         max_tokens=max_tokens,
         temperature=gen_params.get("temperature", 0.7),
         top_p=gen_params.get("top_p", 0.95),
         stop=["<END>"]
-    )["choices"][0]["text"]
+    )
 
-    # Extract only the portion intended as the assistant's message
-    # Remove <END> and any trailing junk
-    text = raw.strip()
-    text = text.split("<END>")[0].strip()
+    if isinstance(response, dict) and "choices" in response:
+        raw = response["choices"][0]["text"]
+    elif hasattr(response, "__iter__"):
+        # assume streaming generator, concatenate chunks
+        raw = "".join(chunk["choices"][0]["text"] for chunk in response)
+    else:
+        raise TypeError(f"Unexpected response type: {type(response).__name__}")
 
-    # Optionally strip any leading label
+    text = raw.strip().split("<END>")[0].strip()
     reply = strip_role(text)
-
     state.window.append(("assistant", reply))
     return reply
-
 
 def speech_to_text(audio_bytes: bytes) -> str:
     """Whisper STT from raw audio bytes (webm, wav, etc.)."""
@@ -179,7 +191,7 @@ def speech_to_text(audio_bytes: bytes) -> str:
         tmp.write(audio_bytes)
         tmp.flush()
         result = whisper_model.transcribe(tmp.name, language="en")
-    return result["text"].strip()
+    return cast(str, result["text"]).strip()
 
 
 def text_to_speech(text: str, voice: str = "af_heart") -> bytes:
@@ -192,7 +204,12 @@ def text_to_speech(text: str, voice: str = "af_heart") -> bytes:
 
     full_audio = []
     for _, _, audio in generator:
-        full_audio.extend(audio)
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+        if isinstance(audio, (list, tuple, np.ndarray)):
+            full_audio.extend(audio)
+        else:
+            raise TypeError(f"Expected iterable audio, got {type(audio).__name__}")
 
     buf = io.BytesIO()
     sf.write(buf, full_audio, 24000, format='WAV')

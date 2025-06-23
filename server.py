@@ -1,5 +1,5 @@
-"""server.py – stable version
-Flask front‑end for the local speech assistant stack.
+"""server.py - stable version
+Flask front-end for the local speech assistant stack.
 
 Highlights
 ----------
@@ -7,7 +7,7 @@ Highlights
 * Robust config helpers without recursion.
 * `/download-model` skips download when file present.
 * All JSON routes safe.
-* Flask session enabled via a per‑run random secret‑key (override with $SECRET_KEY).
+* Flask session enabled via a per-run random secret-key (override with $SECRET_KEY).
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from flask_cors import CORS
 # ---------------------------------------------------------------------------
 # local worker API                                                            
 # ---------------------------------------------------------------------------
-from worker import (  # type: ignore
+from worker import (
     speech_to_text,
     text_to_speech,
     process_message,
@@ -129,7 +129,7 @@ def setup():
 # ---------------------------------------------------------------------------
 
 @app.route("/download-model", methods=["POST"])
-def download_model() -> Response:
+def download_model():
     """Download model if missing or just register its path."""
     data = request.get_json(force=True) or {}
     label = data.get("label") or data.get("model")
@@ -195,7 +195,8 @@ def get_system_prompt():
 
 @app.route("/update-system-prompt", methods=["POST"])
 def update_system_prompt():
-    new_prompt = request.json.get("prompt", "").strip()
+    data = request.get_json(force=True) or {}
+    new_prompt = data.get("prompt", "").strip()
     save_cfg({"system_prompt": new_prompt})
     return jsonify({"status": "ok"})
 
@@ -238,8 +239,9 @@ def stt():                                   # server.py
 
 @app.route("/text-to-speech", methods=["POST"])
 def tts():
-    text = request.json.get("text", "")
-    voice = request.json.get("voice", "af_heart")
+    data = request.get_json(force=True) or {}
+    text = data.get("text", "")
+    voice = data.get("voice", "af_heart")
     wav = text_to_speech(text, voice)
     return jsonify({"audio": base64.b64encode(wav).decode()})
 
