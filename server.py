@@ -30,6 +30,7 @@ from worker import (
     speech_to_text,
     text_to_speech,
     process_message,
+    process_message_stream,
     list_voices,
     load_model,
     DEFAULT_SYSTEM_PROMPT,
@@ -266,6 +267,20 @@ def process_route():
         "ResponseText":  response_txt,
         "ResponseSpeech": base64.b64encode(wav).decode()
     })
+    
+@app.route("/stream-message", methods=["POST"])
+def stream_route():
+    data      = request.get_json(force=True) or {}
+    user_msg  = data.get("userMessage", "")
+    sid       = session.get("sid") or secrets.token_hex(8)
+    session["sid"] = sid
+
+    def generate():
+        # send plain-text lines: {"delta": "..."}
+        for piece in process_message_stream(user_msg, session_id=sid):
+            yield json.dumps({"delta": piece}) + "\n"
+
+    return Response(generate(), mimetype="text/plain")
 
 # ---------------------------------------------------------------------------
 # Run app                                                                     

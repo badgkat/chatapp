@@ -14,7 +14,7 @@ import re
 import tempfile
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple, cast
+from typing import List, Tuple, cast, Any, Dict
 import torch
 
 
@@ -60,8 +60,22 @@ def load_voice(voice_name):
     return tts_func
 
 def strip_role(text: str) -> str:
-    """Remove 'Assistant:' or '### Response' etc. from start of string."""
-    return ROLE_RE.sub("", text).lstrip()
+    """
+    Remove the role prefix ('### Assistant', 'Response:', etc.)
+    Preserve the original spacing so Markdown stays valid.
+    """
+    return ROLE_RE.sub("", text)
+
+def _token_from_chunk(chunk: Any) -> str:
+    """
+    Return the text token from either:
+      • an OpenAI-style dict   →  chunk['choices'][0]['text']
+      • a llama-cpp object     →  chunk.choices[0].text
+    """
+    if isinstance(chunk, dict):                     # mypy / pylance happy
+        return chunk["choices"][0]["text"]
+    # fallback for LlamaCompletionChunk
+    return chunk.choices[0].text        # type: ignore[attr-defined]
 
 def extract_assistant_section(text: str) -> str:
     """Extract content from '### Assistant' to either next heading or <END>."""
@@ -173,7 +187,7 @@ def process_message(user_text: str, session_id: str = "default") -> str:
     )
 
     if isinstance(response, dict) and "choices" in response:
-        raw = response["choices"][0]["text"]
+        raw = "".join(_token_from_chunk(c) for c in response)
     elif hasattr(response, "__iter__"):
         # assume streaming generator, concatenate chunks
         raw = "".join(chunk["choices"][0]["text"] for chunk in response)
@@ -184,6 +198,55 @@ def process_message(user_text: str, session_id: str = "default") -> str:
     reply = strip_role(text)
     state.window.append(("assistant", reply))
     return reply
+
+def process_message_stream(user_text: str, session_id: str = "default"):
+    """
+    Yield assistant text chunks as soon as the model produces them.
+    The final reply is pushed into ChatState once generation finishes.
+    """
+    cfg        = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
+    gen_params = cfg.get("params", {})
+    system_p   = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+
+    max_tokens = int(gen_params.get("max_tokens", 200))
+    n_ctx      = int(gen_params.get("n_ctx", 2048))
+    budget     = n_ctx - max_tokens - 32
+
+    state  = CHAT_STATES.setdefault(session_id, ChatState())
+    prompt = build_prompt(state, user_text, system_p, budget)
+    constraint = (
+        "Respond using markdown sections. Begin your response with:\n\n"
+        "### Assistant\nYour answer here.\n\n"
+        "End with <END>. Don't include anything after <END>."
+    )
+
+    # ------------------------------------------------------------------ #
+    #   run the model in streaming mode
+    # ------------------------------------------------------------------ #
+    stream = load_model()(
+        prompt + "\n### Constraint\n" + constraint,
+        max_tokens=max_tokens,
+        temperature=gen_params.get("temperature", 0.7),
+        top_p=gen_params.get("top_p", 0.95),
+        stop=["<END>"],
+        stream=True,                           # <-- key flag
+    )
+
+    full_reply = []
+    for chunk in stream:
+        token = _token_from_chunk(chunk)
+        full_reply.append(token)
+
+        # strip any leaked role labels in *this* token and yield it
+        cleaned = strip_role(token)
+        if cleaned:                      # avoid sending empty strings
+            yield cleaned
+
+    # ------------------------------------------------------------------ #
+    #   commit the finished reply to chat history
+    # ------------------------------------------------------------------ #
+    reply_text = strip_role("".join(full_reply)).split("<END>")[0].strip()
+    state.window.append(("assistant", reply_text))
 
 def speech_to_text(audio_bytes: bytes) -> str:
     """Whisper STT from raw audio bytes (webm, wav, etc.)."""
