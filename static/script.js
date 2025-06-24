@@ -167,11 +167,18 @@ const populateBotResponse = async (userMessage) => {
   const repeatButtonID = getRandomID();
   botRepeatButtonIDToIndexMap[repeatButtonID] = responses.length - 1;
   hideBotLoadingAnimation();
+  // render markdown → safe HTML
+  const html = DOMPurify.sanitize(marked.parse(response.ResponseText));
+
   $("#message-list").append(
-    `<div class='message-line'><div class='message-box${
-      !lightMode ? " dark" : ""
-    }'>${response.ResponseText}</div>
-    <button id='${repeatButtonID}' class='btn volume repeat-button' onclick='playResponseAudio("data:audio/wav;base64," + responses[botRepeatButtonIDToIndexMap[this.id]].ResponseSpeech);'><i class='fa fa-volume-up'></i></button></div>`
+    `<div class='message-line'>
+      <div class='message-box${!lightMode ? " dark" : ""}'>${html}</div>
+      <button id='${repeatButtonID}' class='btn volume repeat-button'
+              onclick='playResponseAudio("data:audio/wav;base64," +
+                      responses[botRepeatButtonIDToIndexMap[this.id]].ResponseSpeech);'>
+        <i class='fa fa-volume-up'></i>
+      </button>
+    </div>`
   );
   if (talkingMode) {
     playResponseAudio("data:audio/wav;base64," + response.ResponseSpeech);
