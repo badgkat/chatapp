@@ -6,12 +6,7 @@ worker.py ― core back-end logic
 • Guarantees plain-text answers without role labels
 """
 from __future__ import annotations
-
-import io
-import json
-import os
-import re
-import tempfile
+import io, json, os, re, tempfile
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple, cast, Any, Dict
@@ -157,48 +152,6 @@ def build_prompt(state: ChatState,
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def process_message(user_text: str, session_id: str = "default") -> str:
-    """
-    Run one inference turn and update chat history.
-    Returns assistant reply (plain text, no role tags, no <END>).
-    """
-
-    cfg         = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
-    gen_params  = cfg.get("params", {})
-    system_p    = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-
-    max_tokens = int(gen_params.get("max_tokens", 200))
-    n_ctx      = int(gen_params.get("n_ctx", 2048))
-    budget     = n_ctx - max_tokens - 32            # margin
-
-    state  = CHAT_STATES.setdefault(session_id, ChatState())
-    prompt = build_prompt(state, user_text, system_p, budget)
-    constraint = (
-        "Respond using markdown sections. Begin your response with:\n\n"
-        "### Assistant\nYour answer here.\n\n"
-        "End with <END>. Don't include anything after <END>."
-    )
-
-    response = load_model()(
-        prompt + "\n### Constraint\n" + constraint,
-        max_tokens=max_tokens,
-        temperature=gen_params.get("temperature", 0.7),
-        top_p=gen_params.get("top_p", 0.95),
-        stop=["<END>"]
-    )
-
-    if isinstance(response, dict) and "choices" in response:
-        raw = "".join(_token_from_chunk(c) for c in response)
-    elif hasattr(response, "__iter__"):
-        # assume streaming generator, concatenate chunks
-        raw = "".join(chunk["choices"][0]["text"] for chunk in response)
-    else:
-        raise TypeError(f"Unexpected response type: {type(response).__name__}")
-
-    text = raw.strip().split("<END>")[0].strip()
-    reply = strip_role(text)
-    state.window.append(("assistant", reply))
-    return reply
 
 def process_message_stream(user_text: str, session_id: str = "default"):
     """

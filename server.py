@@ -12,15 +12,9 @@ Highlights
 
 from __future__ import annotations
 
-import base64
-import json
-import os
-import re
-import secrets
+import base64, secrets, json, os, re, requests
 from pathlib import Path
 from typing import Any, Dict
-
-import requests
 from flask import Flask, Response, jsonify, render_template, request, session
 from flask_cors import CORS
 
@@ -30,7 +24,6 @@ from flask_cors import CORS
 from worker import (
     speech_to_text,
     text_to_speech,
-    process_message,
     process_message_stream,
     list_voices,
     load_model,
@@ -246,28 +239,6 @@ def tts():
     voice = data.get("voice", "af_heart")
     wav = text_to_speech(text, voice)
     return jsonify({"audio": base64.b64encode(wav).decode()})
-
-
-@app.route("/process-message", methods=["POST"])
-def process_route():
-    data       = request.get_json(force=True) or {}
-    user_msg   = data.get("userMessage", "")
-    voice      = data.get("voice", "af_heart")
-    text_only  = bool(data.get("textOnly"))
-
-    sid = session.get("sid") or secrets.token_hex(8)
-    session["sid"] = sid
-
-    response_txt = process_message(user_msg, session_id=sid).strip()
-
-    if text_only:
-        return jsonify({"ResponseText": response_txt, "ResponseSpeech": ""})
-
-    wav = text_to_speech(response_txt, voice)
-    return jsonify({
-        "ResponseText":  response_txt,
-        "ResponseSpeech": base64.b64encode(wav).decode()
-    })
     
 @app.route("/stream-message", methods=["POST"])
 def stream_route():
@@ -300,7 +271,7 @@ def stream_route_tts():
     buf = []                 # text since last audio chunk
 
     SENT_RE = re.compile(r'([.!?]["\')\]]?\s+)')   # hard boundary
-    MIN_CHARS = 140                                # stream sooner if very long
+    MIN_CHARS = 240                                # stream sooner if very long
 
     def generate():
         buf = ""           # running text since last audio flush
