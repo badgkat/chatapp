@@ -91,6 +91,7 @@ def extract_assistant_section(text: str) -> str:
 def clean_tts_text(text: str) -> str:
     """Sanitize for speech: strip role tags, markdown, and special chars."""
     reply = extract_assistant_section(text)
+    text = re.sub(r"(\d+)\s*/\s*(\d+)", r"\1 divided by \2", text)
     text = re.sub(r"[*_~`>#-]", "", text)          # remove markdown symbols
     text = re.sub(r"\s{2,}", " ", text)            # compress extra spaces
     return text.strip()

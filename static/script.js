@@ -69,14 +69,6 @@ const processUserMessage = async (userMessage) => {
   return response;
 };
 
-const cleanTextInput = (value) => {
-  return value
-    .trim()
-    .replace(/[\n\t]/g, "")
-    .replace(/<[^>]*>/g, "")
-    .replace(/[<>&;]/g, "");
-};
-
 const recordAudio = () => {
   return new Promise(async (resolve, reject) => {
     try {
@@ -176,6 +168,7 @@ const populateUserMessage = (userMessage, userRecording) => {
 };
 
 // === streaming assistant reply ==========================================
+// === streaming assistant reply + TTS ====================================
 const populateBotResponse = async (userMessage) => {
   await showBotLoadingAnimation();
 
@@ -189,11 +182,25 @@ const populateBotResponse = async (userMessage) => {
   scrollToBottom();
   const $box = $("#" + boxID);
 
+  /* audio queue */
+  const audioQueue = [];
+  let audioPlaying = false;
+  const playNext = () => {
+    if (audioPlaying || !audioQueue.length) return;
+    audioPlaying = true;
+    const snd = new Audio(audioQueue.shift());
+    snd.onended = () => {
+      audioPlaying = false;
+      playNext();
+    };
+    snd.play().catch(() => (audioPlaying = false));
+  };
+
   /* stream from the backend */
-  const resp = await fetch(baseUrl + "/stream-message", {
+  const resp = await fetch(baseUrl + "/stream-message-tts", {
     method : "POST",
     headers: { Accept: "text/plain", "Content-Type": "application/json" },
-    body   : JSON.stringify({ userMessage })
+    body   : JSON.stringify({ userMessage, voice: voiceOption })
   });
   if (!resp.body) { hideBotLoadingAnimation(); return; }
 
@@ -211,37 +218,22 @@ const populateBotResponse = async (userMessage) => {
 
     for (const ln of lines) {
       if (!ln.trim()) continue;
-      const { delta } = JSON.parse(ln);
-      const raw = ($box.data("raw") || "") + delta;
-      $box.data("raw", raw);
-      scheduleMarkdownRender($box);       // render throttled
+      const { delta, audio } = JSON.parse(ln);
+
+      if (delta) {
+        const raw = ($box.data("raw") || "") + delta;
+        $box.data("raw", raw);
+        scheduleMarkdownRender($box);
+      }
+      if (audio) {
+        audioQueue.push(`data:audio/wav;base64,${audio}`);
+        playNext();
+      }
     }
   }
-
-  // flush final partial line if any
-  if (leftover.trim()) {
-    const { delta } = JSON.parse(leftover);
-    const raw = ($box.data("raw") || "") + delta;
-    $box.data("raw", raw);
-  }
-  scheduleMarkdownRender($box);           // final render
-
   hideBotLoadingAnimation();
-
-  /* optional TTS */
-  const finalRaw = $box.data("raw") || "";
-  if (talkingMode && finalRaw.trim()) {
-    try {
-      const r = await fetch(baseUrl + "/text-to-speech", {
-        method : "POST",
-        headers: { "Content-Type": "application/json" },
-        body   : JSON.stringify({ text: finalRaw, voice: voiceOption })
-      });
-      const { audio } = await r.json();
-      if (audio) playResponseAudio(`data:audio/wav;base64,${audio}`);
-    } catch (err) { console.error("TTS failed:", err); }
-  }
 };
+
 
 // === MAIN UI INIT ===
 $(document).ready(function () {
@@ -271,7 +263,7 @@ $(document).ready(function () {
 
   // Message input key handler
   $("#message-input").keyup(function (event) {
-    let inputVal = cleanTextInput($("#message-input").val());
+    let inputVal = $("#message-input").val().trim();
 
     if (event.keyCode === 13 && inputVal != "") {
       const message = inputVal;
@@ -322,7 +314,7 @@ $(document).ready(function () {
         console.error("Failed to stop recording or process audio:", err);
       }
     } else {
-      const message = cleanTextInput($("#message-input").val());
+      const message = $("#message-input").val().trim();
       populateUserMessage(message, null);
       populateBotResponse(message);
       $(this)
