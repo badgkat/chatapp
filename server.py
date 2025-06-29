@@ -249,7 +249,7 @@ def stream_message():
     sid      = session.get("sid") or secrets.token_hex(8)
     session["sid"] = sid
 
-    SENT_RE    = re.compile(r'([.!?]["\')\]]?\s+)')
+    SENT_RE = re.compile(r'([.!?]["\')\]]?\s+|\n+)')
     MIN_CHARS  = 240
 
     def generate():

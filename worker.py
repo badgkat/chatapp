@@ -9,7 +9,7 @@ from __future__ import annotations
 import io, json, os, re, tempfile
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple, cast, Any, Dict
+from typing import List, Tuple, cast, Any, Iterator
 import torch
 
 
@@ -148,6 +148,46 @@ def build_prompt(state: ChatState,
 
     return "".join(parts).rstrip()
 
+def _load_gen_cfg() -> tuple[dict, str]:
+    """Return (gen_params, system_prompt) from config.json or defaults."""
+    cfg = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
+    return cfg.get("params", {}), cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+
+
+def _get_state(session_id: str) -> ChatState:
+    """Return chat history object for this session."""
+    return CHAT_STATES.setdefault(session_id, ChatState())
+
+
+def _run_llm(prompt: str, gen: dict) -> Any:
+    """Stream tokens from the underlying Llama model."""
+    return load_model()(
+        prompt,
+        max_tokens=int(gen.get("max_tokens", 200)),
+        temperature=gen.get("temperature", 0.7),
+        top_p=gen.get("top_p", 0.95),
+        stop=["<END>"],
+        stream=True,
+    )
+
+
+
+def _yield_clean(stream) -> Iterator[Tuple[str, List[str]]]:
+    """Yield (clean_delta, full_list_pointer) pairs while building *full*."""
+    full: List[str] = []
+    for chunk in stream:
+        token = _token_from_chunk(chunk)
+        full.append(token)
+        cleaned = strip_role(token)
+        if cleaned:
+            yield cleaned, full
+
+
+def _commit_reply(state: ChatState, full: list[str]) -> None:
+    """Save assistant reply into rolling window."""
+    reply = strip_role("".join(full)).split("<END>")[0].strip()
+    state.window.append(("assistant", reply))
+
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -155,52 +195,32 @@ def build_prompt(state: ChatState,
 
 def process_message_stream(user_text: str, session_id: str = "default"):
     """
-    Yield assistant text chunks as soon as the model produces them.
-    The final reply is pushed into ChatState once generation finishes.
+    Stream assistant output. Yields cleaned deltas for the client.
+    Side-effect: pushes completed assistant reply into ChatState.
     """
-    cfg        = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
-    gen_params = cfg.get("params", {})
-    system_p   = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-
+    gen_params, system_p = _load_gen_cfg()
     max_tokens = int(gen_params.get("max_tokens", 200))
     n_ctx      = int(gen_params.get("n_ctx", 2048))
     budget     = n_ctx - max_tokens - 32
 
-    state  = CHAT_STATES.setdefault(session_id, ChatState())
-    prompt = build_prompt(state, user_text, system_p, budget)
+    state   = _get_state(session_id)
+    prompt  = build_prompt(state, user_text, system_p, budget)
+
     constraint = (
         "Respond using markdown sections. Begin your response with:\n\n"
         "### Assistant\nYour answer here.\n\n"
         "End with <END>. Don't include anything after <END>."
     )
 
-    # ------------------------------------------------------------------ #
-    #   run the model in streaming mode
-    # ------------------------------------------------------------------ #
-    stream = load_model()(
-        prompt + "\n### Constraint\n" + constraint,
-        max_tokens=max_tokens,
-        temperature=gen_params.get("temperature", 0.7),
-        top_p=gen_params.get("top_p", 0.95),
-        stop=["<END>"],
-        stream=True,                           # <-- key flag
-    )
+    llm_stream = _run_llm(prompt + "\n### Constraint\n" + constraint, gen_params)
 
-    full_reply = []
-    for chunk in stream:
-        token = _token_from_chunk(chunk)
-        full_reply.append(token)
+    # relay tokens to caller while collecting the full reply
+    full_reply: list[str] = []
+    for cleaned, full_ptr in _yield_clean(llm_stream):
+        full_reply = full_ptr         # same list object grows in-place
+        yield cleaned
 
-        # strip any leaked role labels in *this* token and yield it
-        cleaned = strip_role(token)
-        if cleaned:                      # avoid sending empty strings
-            yield cleaned
-
-    # ------------------------------------------------------------------ #
-    #   commit the finished reply to chat history
-    # ------------------------------------------------------------------ #
-    reply_text = strip_role("".join(full_reply)).split("<END>")[0].strip()
-    state.window.append(("assistant", reply_text))
+    _commit_reply(state, full_reply)
 
 def speech_to_text(audio_bytes: bytes) -> str:
     """Whisper STT from raw audio bytes (webm, wav, etc.)."""
