@@ -55,20 +55,6 @@ const getSpeechToText = async (userRecording) => {
   return response.text;
 };
 
-const processUserMessage = async (userMessage) => {
-  let response = await fetch(baseUrl + "/process-message", {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ 
-      userMessage: userMessage, 
-      voice: voiceOption,
-      textOnly: !talkingMode
-   }),
-  });
-  response = await response.json();
-  return response;
-};
-
 const recordAudio = () => {
   return new Promise(async (resolve, reject) => {
     try {
@@ -167,7 +153,6 @@ const populateUserMessage = (userMessage, userRecording) => {
   scrollToBottom();
 };
 
-// === streaming assistant reply ==========================================
 // === streaming assistant reply + TTS ====================================
 const populateBotResponse = async (userMessage) => {
   await showBotLoadingAnimation();
@@ -197,11 +182,16 @@ const populateBotResponse = async (userMessage) => {
   };
 
   /* stream from the backend */
-  const resp = await fetch(baseUrl + "/stream-message-tts", {
+  const resp = await fetch(baseUrl + "/stream-message", {
     method : "POST",
     headers: { Accept: "text/plain", "Content-Type": "application/json" },
-    body   : JSON.stringify({ userMessage, voice: voiceOption })
+    body   : JSON.stringify({ 
+      userMessage, 
+      voice: voiceOption, 
+      use_tts: talkingMode 
+    })
   });
+
   if (!resp.body) { hideBotLoadingAnimation(); return; }
 
   const rdr    = resp.body.getReader();

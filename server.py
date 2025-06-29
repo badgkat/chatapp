@@ -241,70 +241,47 @@ def tts():
     return jsonify({"audio": base64.b64encode(wav).decode()})
     
 @app.route("/stream-message", methods=["POST"])
-def stream_route():
-    data      = request.get_json(force=True) or {}
-    user_msg  = data.get("userMessage", "")
-    sid       = session.get("sid") or secrets.token_hex(8)
+def stream_message():
+    data     = request.get_json(force=True) or {}
+    user_msg = data.get("userMessage", "")
+    voice    = data.get("voice", None)
+    use_tts  = data.get("use_tts", False)
+    sid      = session.get("sid") or secrets.token_hex(8)
     session["sid"] = sid
 
-    def generate():
-        # send plain-text lines: {"delta": "..."}
-        for piece in process_message_stream(user_msg, session_id=sid):
-            yield json.dumps({"delta": piece}) + "\n"
-
-    return Response(generate(), mimetype="text/plain")
-
-@app.route("/stream-message-tts", methods=["POST"])
-def stream_route_tts():
-    """
-    Stream text deltas *and* small WAV fragments.
-    Each JSON line looks like: {"delta": "...", "audio": "base64|"}
-    Audio is emitted at every sentence boundary (., ?, !) or when 80 chars
-    have accumulated, whichever comes first.
-    """
-    data      = request.get_json(force=True) or {}
-    user_msg  = data.get("userMessage", "")
-    voice     = data.get("voice", "af_heart")
-    sid       = session.get("sid") or secrets.token_hex(8)
-    session["sid"] = sid
-
-    buf = []                 # text since last audio chunk
-
-    SENT_RE = re.compile(r'([.!?]["\')\]]?\s+)')   # hard boundary
-    MIN_CHARS = 240                                # stream sooner if very long
+    SENT_RE    = re.compile(r'([.!?]["\')\]]?\s+)')
+    MIN_CHARS  = 240
 
     def generate():
-        buf = ""           # running text since last audio flush
+        if not use_tts:
+            for piece in process_message_stream(user_msg, session_id=sid):
+                yield json.dumps({"delta": piece}) + "\n"
+            return
 
+        buf = ""
         for delta in process_message_stream(user_msg, session_id=sid):
             yield json.dumps({"delta": delta, "audio": ""}) + "\n"
             buf += delta
 
-            # While we have ≥1 full sentence, peel them off.
             while True:
                 m = SENT_RE.search(buf)
                 if not m:
                     break
-                cut = m.end()                       # end of the first full sentence
+                cut = m.end()
                 chunk, buf = buf[:cut], buf[cut:]
-
-                wav = text_to_speech(chunk + " ...", voice)
-                
+                wav = text_to_speech(chunk + " ...", voice or "af_heart")
                 yield json.dumps({"delta": "", "audio": base64.b64encode(wav).decode()}) + "\n"
 
-            # Safety valve: very long clause with no terminal punctuation.
             if len(buf) > MIN_CHARS:
-                wav = text_to_speech(buf + " ...", voice)
+                wav = text_to_speech(buf + " ...", voice or "af_heart")
                 yield json.dumps({"delta": "", "audio": base64.b64encode(wav).decode()}) + "\n"
                 buf = ""
 
-        # flush tail
         if buf.strip():
-            wav = text_to_speech(buf + " ...", voice)
+            wav = text_to_speech(buf + " ...", voice or "af_heart")
             yield json.dumps({"delta": "", "audio": base64.b64encode(wav).decode()}) + "\n"
 
     return Response(generate(), mimetype="text/plain")
-
 # ---------------------------------------------------------------------------
 # Run app                                                                     
 # ---------------------------------------------------------------------------
