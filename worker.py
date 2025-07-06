@@ -6,17 +6,12 @@ worker.py ― core back-end logic
 • Guarantees plain-text answers without role labels
 """
 from __future__ import annotations
-
-import base64
-import io
-import json
-import os
-import re
-import subprocess
-import tempfile
+import io, json, os, re, tempfile
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, cast, Any, Iterator
+import torch
+
 
 import soundfile as sf
 import whisper
@@ -24,6 +19,7 @@ from kokoro import KPipeline
 from llama_cpp import Llama
 
 from context_state import ChatState   # small @dataclass storing a .window list
+from collections.abc import Sequence
 
 # --------------------------------------------------------------------------- #
 # Config & globals
@@ -59,13 +55,38 @@ def load_voice(voice_name):
     return tts_func
 
 def strip_role(text: str) -> str:
-    """Remove 'Assistant:' or '### Response' etc. from start of string."""
-    return ROLE_RE.sub("", text).lstrip()
+    """
+    Remove the role prefix ('### Assistant', 'Response:', etc.)
+    Preserve the original spacing so Markdown stays valid.
+    """
+    return ROLE_RE.sub("", text)
 
+def _token_from_chunk(chunk: Any) -> str:
+    """
+    Return the text token from either:
+      • an OpenAI-style dict   →  chunk['choices'][0]['text']
+      • a llama-cpp object     →  chunk.choices[0].text
+    """
+    if isinstance(chunk, dict):                     # mypy / pylance happy
+        return chunk["choices"][0]["text"]
+    # fallback for LlamaCompletionChunk
+    return chunk.choices[0].text        # type: ignore[attr-defined]
+
+def extract_assistant_section(text: str) -> str:
+    """Extract content from '### Assistant' to either next heading or <END>."""
+    # Normalize and isolate
+    text = text.strip().split("<END>")[0]
+
+    # Match the Assistant section
+    match = re.search(r'###\s*Assistant\s*\n+(.*?)(\n###|\Z)', text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
 
 def clean_tts_text(text: str) -> str:
     """Sanitize for speech: strip role tags, markdown, and special chars."""
-    text = strip_role(text)
+    reply = extract_assistant_section(text)
+    text = re.sub(r"(\d+)\s*/\s*(\d+)", r"\1 divided by \2", text)
     text = re.sub(r"[*_~`>#-]", "", text)          # remove markdown symbols
     text = re.sub(r"\s{2,}", " ", text)            # compress extra spaces
     return text.strip()
@@ -110,7 +131,7 @@ def build_prompt(state: ChatState,
     Assemble system + recent chat history + new user message
     ensuring token count < budget_tokens.
     """
-    hist: List[Tuple[str, str]] = state.window.copy()
+    hist: Sequence[Tuple[str, str]] = list(state.window)
     hist.append(("user", user_msg))
 
     # walk history backwards until under budget
@@ -127,51 +148,79 @@ def build_prompt(state: ChatState,
 
     return "".join(parts).rstrip()
 
+def _load_gen_cfg() -> tuple[dict, str]:
+    """Return (gen_params, system_prompt) from config.json or defaults."""
+    cfg = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
+    return cfg.get("params", {}), cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+
+
+def _get_state(session_id: str) -> ChatState:
+    """Return chat history object for this session."""
+    return CHAT_STATES.setdefault(session_id, ChatState())
+
+
+def _run_llm(prompt: str, gen: dict) -> Any:
+    """Stream tokens from the underlying Llama model."""
+    return load_model()(
+        prompt,
+        max_tokens=int(gen.get("max_tokens", 200)),
+        temperature=gen.get("temperature", 0.7),
+        top_p=gen.get("top_p", 0.95),
+        stop=["<END>"],
+        stream=True,
+    )
+
+
+
+def _yield_clean(stream) -> Iterator[Tuple[str, List[str]]]:
+    """Yield (clean_delta, full_list_pointer) pairs while building *full*."""
+    full: List[str] = []
+    for chunk in stream:
+        token = _token_from_chunk(chunk)
+        full.append(token)
+        cleaned = strip_role(token)
+        if cleaned:
+            yield cleaned, full
+
+
+def _commit_reply(state: ChatState, full: list[str]) -> None:
+    """Save assistant reply into rolling window."""
+    reply = strip_role("".join(full)).split("<END>")[0].strip()
+    state.window.append(("assistant", reply))
+
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def process_message(user_text: str, session_id: str = "default") -> str:
-    """
-    Run one inference turn and update chat history.
-    Returns assistant reply (plain text, no role tags, no <END>).
-    """
 
-    cfg         = json.load(CONFIG_PATH.open()) if CONFIG_PATH.exists() else {}
-    gen_params  = cfg.get("params", {})
-    system_p    = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-
+def process_message_stream(user_text: str, session_id: str = "default"):
+    """
+    Stream assistant output. Yields cleaned deltas for the client.
+    Side-effect: pushes completed assistant reply into ChatState.
+    """
+    gen_params, system_p = _load_gen_cfg()
     max_tokens = int(gen_params.get("max_tokens", 200))
     n_ctx      = int(gen_params.get("n_ctx", 2048))
-    budget     = n_ctx - max_tokens - 32            # margin
+    budget     = n_ctx - max_tokens - 32
 
-    state  = CHAT_STATES.setdefault(session_id, ChatState())
-    prompt = build_prompt(state, user_text, system_p, budget)
+    state   = _get_state(session_id)
+    prompt  = build_prompt(state, user_text, system_p, budget)
 
     constraint = (
-        "Reply with plain text only. No role labels or markdown headings.\n"
-        f"Reply ≤{max_tokens} tokens and finish with <END>"
+        "Respond using markdown sections. Begin your response with:\n\n"
+        "### Assistant\nYour answer here.\n\n"
+        "End with <END>. Don't include anything after <END>."
     )
 
-    raw = load_model()(
-        prompt + "\n### Constraint\n" + constraint,
-        max_tokens=max_tokens,
-        temperature=gen_params.get("temperature", 0.7),
-        top_p=gen_params.get("top_p", 0.95),
-        stop=["<END>"]
-    )["choices"][0]["text"]
+    llm_stream = _run_llm(prompt + "\n### Constraint\n" + constraint, gen_params)
 
-    # Extract only the portion intended as the assistant's message
-    # Remove <END> and any trailing junk
-    text = raw.strip()
-    text = text.split("<END>")[0].strip()
+    # relay tokens to caller while collecting the full reply
+    full_reply: list[str] = []
+    for cleaned, full_ptr in _yield_clean(llm_stream):
+        full_reply = full_ptr         # same list object grows in-place
+        yield cleaned
 
-    # Optionally strip any leading label
-    reply = strip_role(text)
-
-    state.window.append(("assistant", reply))
-    return reply
-
+    _commit_reply(state, full_reply)
 
 def speech_to_text(audio_bytes: bytes) -> str:
     """Whisper STT from raw audio bytes (webm, wav, etc.)."""
@@ -179,7 +228,7 @@ def speech_to_text(audio_bytes: bytes) -> str:
         tmp.write(audio_bytes)
         tmp.flush()
         result = whisper_model.transcribe(tmp.name, language="en")
-    return result["text"].strip()
+    return cast(str, result["text"]).strip()
 
 
 def text_to_speech(text: str, voice: str = "af_heart") -> bytes:
@@ -192,7 +241,12 @@ def text_to_speech(text: str, voice: str = "af_heart") -> bytes:
 
     full_audio = []
     for _, _, audio in generator:
-        full_audio.extend(audio)
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+        if isinstance(audio, (list, tuple, np.ndarray)):
+            full_audio.extend(audio)
+        else:
+            raise TypeError(f"Expected iterable audio, got {type(audio).__name__}")
 
     buf = io.BytesIO()
     sf.write(buf, full_audio, 24000, format='WAV')

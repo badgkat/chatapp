@@ -1,5 +1,5 @@
-"""server.py – stable version
-Flask front‑end for the local speech assistant stack.
+"""server.py - stable version
+Flask front-end for the local speech assistant stack.
 
 Highlights
 ----------
@@ -7,29 +7,24 @@ Highlights
 * Robust config helpers without recursion.
 * `/download-model` skips download when file present.
 * All JSON routes safe.
-* Flask session enabled via a per‑run random secret‑key (override with $SECRET_KEY).
+* Flask session enabled via a per-run random secret-key (override with $SECRET_KEY).
 """
 
 from __future__ import annotations
 
-import base64
-import json
-import os
-import secrets
+import base64, secrets, json, os, re, requests
 from pathlib import Path
 from typing import Any, Dict
-
-import requests
 from flask import Flask, Response, jsonify, render_template, request, session
 from flask_cors import CORS
 
 # ---------------------------------------------------------------------------
 # local worker API                                                            
 # ---------------------------------------------------------------------------
-from worker import (  # type: ignore
+from worker import (
     speech_to_text,
     text_to_speech,
-    process_message,
+    process_message_stream,
     list_voices,
     load_model,
     DEFAULT_SYSTEM_PROMPT,
@@ -129,7 +124,7 @@ def setup():
 # ---------------------------------------------------------------------------
 
 @app.route("/download-model", methods=["POST"])
-def download_model() -> Response:
+def download_model():
     """Download model if missing or just register its path."""
     data = request.get_json(force=True) or {}
     label = data.get("label") or data.get("model")
@@ -195,7 +190,8 @@ def get_system_prompt():
 
 @app.route("/update-system-prompt", methods=["POST"])
 def update_system_prompt():
-    new_prompt = request.json.get("prompt", "").strip()
+    data = request.get_json(force=True) or {}
+    new_prompt = data.get("prompt", "").strip()
     save_cfg({"system_prompt": new_prompt})
     return jsonify({"status": "ok"})
 
@@ -238,33 +234,54 @@ def stt():                                   # server.py
 
 @app.route("/text-to-speech", methods=["POST"])
 def tts():
-    text = request.json.get("text", "")
-    voice = request.json.get("voice", "af_heart")
+    data = request.get_json(force=True) or {}
+    text = data.get("text", "")
+    voice = data.get("voice", "af_heart")
     wav = text_to_speech(text, voice)
     return jsonify({"audio": base64.b64encode(wav).decode()})
-
-
-@app.route("/process-message", methods=["POST"])
-def process_route():
-    data       = request.get_json(force=True) or {}
-    user_msg   = data.get("userMessage", "")
-    voice      = data.get("voice", "af_heart")
-    text_only  = bool(data.get("textOnly"))
-
-    sid = session.get("sid") or secrets.token_hex(8)
+    
+@app.route("/stream-message", methods=["POST"])
+def stream_message():
+    data     = request.get_json(force=True) or {}
+    user_msg = data.get("userMessage", "")
+    voice    = data.get("voice", None)
+    use_tts  = data.get("use_tts", False)
+    sid      = session.get("sid") or secrets.token_hex(8)
     session["sid"] = sid
 
-    response_txt = process_message(user_msg, session_id=sid).strip()
+    SENT_RE = re.compile(r'([.!?]["\')\]]?\s+|\n+)')
+    MIN_CHARS  = 240
 
-    if text_only:
-        return jsonify({"ResponseText": response_txt, "ResponseSpeech": ""})
+    def generate():
+        if not use_tts:
+            for piece in process_message_stream(user_msg, session_id=sid):
+                yield json.dumps({"delta": piece}) + "\n"
+            return
 
-    wav = text_to_speech(response_txt, voice)
-    return jsonify({
-        "ResponseText":  response_txt,
-        "ResponseSpeech": base64.b64encode(wav).decode()
-    })
+        buf = ""
+        for delta in process_message_stream(user_msg, session_id=sid):
+            yield json.dumps({"delta": delta, "audio": ""}) + "\n"
+            buf += delta
 
+            while True:
+                m = SENT_RE.search(buf)
+                if not m:
+                    break
+                cut = m.end()
+                chunk, buf = buf[:cut], buf[cut:]
+                wav = text_to_speech(chunk + " ...", voice or "af_heart")
+                yield json.dumps({"delta": "", "audio": base64.b64encode(wav).decode()}) + "\n"
+
+            if len(buf) > MIN_CHARS:
+                wav = text_to_speech(buf + " ...", voice or "af_heart")
+                yield json.dumps({"delta": "", "audio": base64.b64encode(wav).decode()}) + "\n"
+                buf = ""
+
+        if buf.strip():
+            wav = text_to_speech(buf + " ...", voice or "af_heart")
+            yield json.dumps({"delta": "", "audio": base64.b64encode(wav).decode()}) + "\n"
+
+    return Response(generate(), mimetype="text/plain")
 # ---------------------------------------------------------------------------
 # Run app                                                                     
 # ---------------------------------------------------------------------------

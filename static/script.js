@@ -30,6 +30,22 @@ function hideUserLoadingAnimation() {
   $(".loading-animation")[0].style.display = "none";
 }
 
+// throttle Markdown work to once per animation frame
+const scheduleMarkdownRender = (() => {
+  let pending = null;
+  return ($el) => {
+    if (pending) return;
+    pending = $el;
+    requestAnimationFrame(() => {
+      const raw = pending.data("raw") || "";
+      pending.html(DOMPurify.sanitize(marked.parse(raw)));
+      pending = null;
+      scrollToBottom();
+    });
+  };
+})();
+
+
 const getSpeechToText = async (userRecording) => {
   let response = await fetch(baseUrl + "/speech-to-text", {
     method: "POST",
@@ -37,28 +53,6 @@ const getSpeechToText = async (userRecording) => {
   });
   response = await response.json();
   return response.text;
-};
-
-const processUserMessage = async (userMessage) => {
-  let response = await fetch(baseUrl + "/process-message", {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ 
-      userMessage: userMessage, 
-      voice: voiceOption,
-      textOnly: !talkingMode
-   }),
-  });
-  response = await response.json();
-  return response;
-};
-
-const cleanTextInput = (value) => {
-  return value
-    .trim()
-    .replace(/[\n\t]/g, "")
-    .replace(/<[^>]*>/g, "")
-    .replace(/[<>&;]/g, "");
 };
 
 const recordAudio = () => {
@@ -159,25 +153,77 @@ const populateUserMessage = (userMessage, userRecording) => {
   scrollToBottom();
 };
 
+// === streaming assistant reply + TTS ====================================
 const populateBotResponse = async (userMessage) => {
   await showBotLoadingAnimation();
-  const response = await processUserMessage(userMessage);
-  responses.push(response);
 
-  const repeatButtonID = getRandomID();
-  botRepeatButtonIDToIndexMap[repeatButtonID] = responses.length - 1;
-  hideBotLoadingAnimation();
+  /* shell for the incoming reply */
+  const boxID = getRandomID();
   $("#message-list").append(
-    `<div class='message-line'><div class='message-box${
-      !lightMode ? " dark" : ""
-    }'>${response.ResponseText}</div>
-    <button id='${repeatButtonID}' class='btn volume repeat-button' onclick='playResponseAudio("data:audio/wav;base64," + responses[botRepeatButtonIDToIndexMap[this.id]].ResponseSpeech);'><i class='fa fa-volume-up'></i></button></div>`
+    `<div class='message-line'>
+       <div id='${boxID}' class='message-box${!lightMode ? " dark" : ""}'></div>
+     </div>`
   );
-  if (talkingMode) {
-    playResponseAudio("data:audio/wav;base64," + response.ResponseSpeech);
-    scrollToBottom();
+  scrollToBottom();
+  const $box = $("#" + boxID);
+
+  /* audio queue */
+  const audioQueue = [];
+  let audioPlaying = false;
+  const playNext = () => {
+    if (audioPlaying || !audioQueue.length) return;
+    audioPlaying = true;
+    const snd = new Audio(audioQueue.shift());
+    snd.onended = () => {
+      audioPlaying = false;
+      playNext();
+    };
+    snd.play().catch(() => (audioPlaying = false));
+  };
+
+  /* stream from the backend */
+  const resp = await fetch(baseUrl + "/stream-message", {
+    method : "POST",
+    headers: { Accept: "text/plain", "Content-Type": "application/json" },
+    body   : JSON.stringify({ 
+      userMessage, 
+      voice: voiceOption, 
+      use_tts: talkingMode 
+    })
+  });
+
+  if (!resp.body) { hideBotLoadingAnimation(); return; }
+
+  const rdr    = resp.body.getReader();
+  const dec    = new TextDecoder("utf-8");
+  let leftover = "";
+
+  while (true) {
+    const { value, done } = await rdr.read();
+    if (done) break;
+
+    leftover += dec.decode(value, { stream: true });
+    const lines = leftover.split("\n");
+    leftover = lines.pop();               // keep partial JSON line
+
+    for (const ln of lines) {
+      if (!ln.trim()) continue;
+      const { delta, audio } = JSON.parse(ln);
+
+      if (delta) {
+        const raw = ($box.data("raw") || "") + delta;
+        $box.data("raw", raw);
+        scheduleMarkdownRender($box);
+      }
+      if (audio) {
+        audioQueue.push(`data:audio/wav;base64,${audio}`);
+        playNext();
+      }
+    }
   }
+  hideBotLoadingAnimation();
 };
+
 
 // === MAIN UI INIT ===
 $(document).ready(function () {
@@ -207,7 +253,7 @@ $(document).ready(function () {
 
   // Message input key handler
   $("#message-input").keyup(function (event) {
-    let inputVal = cleanTextInput($("#message-input").val());
+    let inputVal = $("#message-input").val().trim();
 
     if (event.keyCode === 13 && inputVal != "") {
       const message = inputVal;
@@ -258,7 +304,7 @@ $(document).ready(function () {
         console.error("Failed to stop recording or process audio:", err);
       }
     } else {
-      const message = cleanTextInput($("#message-input").val());
+      const message = $("#message-input").val().trim();
       populateUserMessage(message, null);
       populateBotResponse(message);
       $(this)
